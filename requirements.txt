@@ -1,0 +1,9 @@
+pandas>=2.1
+numpy>=1.26
+scipy>=1.11
+statsmodels>=0.14
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+openai>=1.40        # Kimi's API is OpenAI-compatible
+yfinance>=0.2.40
