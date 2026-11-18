@@ -5,6 +5,8 @@ import hashlib
 import json
 import re
 import time
+import warnings
+from collections import Counter
 
 import config
 
@@ -41,6 +43,7 @@ TEXT:
 \"\"\""""
 
 _client = None
+PROMPT_HASH = hashlib.sha256(f"{SYSTEM_PROMPT}\n{EXTRACTION_PROMPT}".encode()).hexdigest()
 
 
 def _get_client():
@@ -53,7 +56,8 @@ def _get_client():
 
 def _cache_key(text: str, meta: dict) -> str:
     h = hashlib.sha256()
-    h.update(f"{config.KIMI_MODEL}|{config.PROMPT_VERSION}|{config.MOCK_MODE}|".encode())
+    model = "dictionary-mock" if config.MOCK_MODE else config.KIMI_MODEL
+    h.update(f"{model}|{config.PROMPT_VERSION}|{PROMPT_HASH}|{config.MOCK_MODE}|".encode())
     h.update(json.dumps(meta, sort_keys=True).encode())
     h.update(text.encode())
     return h.hexdigest()
@@ -72,11 +76,18 @@ def _call_kimi(prompt: str, retries: int = 4) -> dict:
             )
             content = resp.choices[0].message.content
             return json.loads(content)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
             # Occasionally the model wraps JSON in prose; salvage the outer object.
             m = re.search(r"\{.*\}", content or "", re.S)
             if m:
-                return json.loads(m.group(0))
+                try:
+                    return json.loads(m.group(0))
+                except json.JSONDecodeError as salvage_error:
+                    e = salvage_error
+            if attempt == retries - 1:
+                raise e
+            time.sleep(2 ** attempt * 2)
+            print(f"  Kimi retry {attempt + 1}: {e}")
         except Exception as e:  # rate limit / transient network
             if attempt == retries - 1:
                 raise
@@ -86,7 +97,8 @@ def _call_kimi(prompt: str, retries: int = 4) -> dict:
 
 
 # ----------------------------------------------------------------------------- mock
-# Tiny slice of the Loughran-McDonald finance dictionaries.
+# These small sets are only an offline fallback; a full LM dictionary can be
+# supplied at config.LM_DICTIONARY_PATH.
 LM_POS = set("achieve attain benefit gain gains growth improve improved improvement increase "
              "increased opportunity profitable record strong stronger exceed exceeded favorable".split())
 LM_NEG = set("adverse decline declined decrease loss losses impairment litigation weak weaker "
@@ -94,14 +106,77 @@ LM_NEG = set("adverse decline declined decrease loss losses impairment litigatio
 LM_UNC = set("may could might uncertain uncertainty approximately risk possible depend "
              "believe anticipate fluctuate".split())
 
+_lm_words: dict[str, set[str]] | None = None
+_lm_source_reported = False
+
+
+def _load_lm_words() -> dict[str, set[str]]:
+    global _lm_words, _lm_source_reported
+    if _lm_words is not None:
+        return _lm_words
+    path = config.LM_DICTIONARY_PATH
+    if path.exists():
+        import pandas as pd
+
+        table = pd.read_csv(path)
+        columns = {str(c).strip().lower(): c for c in table.columns}
+        word_column = columns.get("word")
+        categories = ("positive", "negative", "uncertainty")
+        if word_column is None or any(c not in columns for c in categories):
+            raise ValueError(
+                f"{path} must contain Word, Positive, Negative, and Uncertainty columns"
+            )
+        words = table[word_column].astype(str).str.lower()
+        _lm_words = {
+            category: set(words[table[columns[category]].fillna(0).astype(float) > 0])
+            for category in categories
+        }
+    else:
+        _lm_words = {"positive": LM_POS, "negative": LM_NEG, "uncertainty": LM_UNC}
+        if not _lm_source_reported:
+            warnings.warn(
+                f"Full Loughran-McDonald dictionary not found at {path}; "
+                "using the small built-in fallback.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _lm_source_reported = True
+    return _lm_words
+
+
+def lm_dictionary_source() -> str:
+    return str(config.LM_DICTIONARY_PATH) if config.LM_DICTIONARY_PATH.exists() else "built-in miniature fallback"
+
+
+def dictionary_fingerprint() -> str:
+    if config.LM_DICTIONARY_PATH.exists():
+        return hashlib.sha256(config.LM_DICTIONARY_PATH.read_bytes()).hexdigest()
+    fallback = "\n".join(
+        ",".join(sorted(words)) for words in (LM_POS, LM_NEG, LM_UNC)
+    )
+    return hashlib.sha256(fallback.encode()).hexdigest()
+
 
 def dictionary_scores(text: str) -> dict:
     words = re.findall(r"[a-z]+", text.lower())
     n = max(len(words), 1)
-    pos = sum(w in LM_POS for w in words)
-    neg = sum(w in LM_NEG for w in words)
-    unc = sum(w in LM_UNC for w in words)
+    categories = _load_lm_words()
+    pos = sum(w in categories["positive"] for w in words)
+    neg = sum(w in categories["negative"] for w in words)
+    unc = sum(w in categories["uncertainty"] for w in words)
     return {"lm_net": (pos - neg) / max(pos + neg, 1), "lm_uncertainty": unc / n, "n_words": n}
+
+
+def text_sketch(text: str, dimensions: int = 512) -> list[int]:
+    """Create a stable signed-hash bag-of-words vector for text-change comparisons."""
+    counts = Counter(re.findall(r"[a-z]+", text.lower()))
+    vector = [0] * dimensions
+    for word, count in counts.items():
+        digest = hashlib.sha256(word.encode()).digest()
+        bucket = int.from_bytes(digest[:8], "big") % dimensions
+        sign = 1 if digest[8] & 1 else -1
+        vector[bucket] += sign * count
+    return vector
 
 
 def _mock_extract(text: str) -> dict:
@@ -170,7 +245,13 @@ def extract(text: str, ticker: str, form: str, section: str, date: str) -> dict:
     meta = {"ticker": ticker, "form": form, "section": section, "date": date}
     path = config.CACHE_DIR / f"{_cache_key(text, meta)}.json"
     if path.exists():
-        return json.loads(path.read_text())
+        result = json.loads(path.read_text())
+        result["dictionary"] = dictionary_scores(text)
+        result["text_sketch"] = text_sketch(text)
+        result["dictionary_hash"] = dictionary_fingerprint()
+        result["dictionary_source"] = lm_dictionary_source()
+        path.write_text(json.dumps(result))
+        return result
 
     if config.MOCK_MODE:
         result = _mock_extract(text)
@@ -180,5 +261,12 @@ def extract(text: str, ticker: str, form: str, section: str, date: str) -> dict:
         result = _merge(parts, [len(c) for c in chunks])
 
     result["dictionary"] = dictionary_scores(text)  # always keep the baseline alongside
+    result["text_sketch"] = text_sketch(text)
+    result["extraction_mode"] = "mock" if config.MOCK_MODE else "kimi"
+    result["model"] = "dictionary-mock" if config.MOCK_MODE else config.KIMI_MODEL
+    result["prompt_version"] = config.PROMPT_VERSION
+    result["prompt_hash"] = PROMPT_HASH
+    result["dictionary_hash"] = dictionary_fingerprint()
+    result["dictionary_source"] = lm_dictionary_source()
     path.write_text(json.dumps(result))
     return result

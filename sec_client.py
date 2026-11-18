@@ -155,8 +155,10 @@ SECTIONS = {
 
 def extract_section(text: str, start_pat: str, end_pat: str, min_len: int = 500) -> str:
     best = ""
-    for m in re.finditer(start_pat, text, re.I):
-        end = re.compile(end_pat, re.I).search(text, m.end())
+    start = re.compile(r"^[ \t]*(?:" + start_pat + r")", re.I | re.M)
+    end_pattern = re.compile(r"^[ \t]*(?:" + end_pat + r")", re.I | re.M)
+    for m in start.finditer(text):
+        end = end_pattern.search(text, m.end())
         span = text[m.start(): end.start() if end else len(text)]
         if len(span) > len(best):
             best = span
@@ -164,13 +166,26 @@ def extract_section(text: str, start_pat: str, end_pat: str, min_len: int = 500)
 
 
 def extract_sections(form: str, text: str) -> dict[str, str]:
-    """Return {section_name: text}. Falls back to the full document if parsing fails."""
+    """Return parsed sections; parsing failures are represented by an empty mapping."""
     out = {}
     for name, (s, e) in SECTIONS.get(form, {}).items():
         sec = extract_section(text, s, e)
         if sec:
             out[name] = sec
-    return out or {"full_text": text}
+    return out
+
+
+def sp500_constituents() -> dict[str, str]:
+    """Return the current S&P 500 ticker -> GICS sector mapping from Wikipedia."""
+    tables = pd.read_html(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        storage_options={"User-Agent": config.SEC_USER_AGENT},
+    )
+    table = tables[0]
+    return {
+        str(row["Symbol"]).replace(".", "-").upper(): str(row["GICS Sector"])
+        for _, row in table.iterrows()
+    }
 
 
 def filing_to_record(f: Filing) -> dict:
